@@ -75,7 +75,7 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
-use tokio::time::sleep;
+use tokio::time::sleep_until;
 
 /// Errors that can occur when working with recorded streams.
 #[derive(Debug, Clone, PartialEq)]
@@ -299,39 +299,54 @@ impl<S> Recording<S> {
     }
 }
 
-impl<S: Stream> RecordedStream<S> {
+impl<S: Stream> RecordedStream<S>
+where
+    S::Item: Clone,
+{
     /// Returns a clone of the recording.
     ///
     /// Requires S::Item: Clone because Recording derives Clone
-    pub fn recording(&self) -> Recording<S::Item>
-    where
-        S::Item: Clone,
-    {
+    pub fn recording(&self) -> Recording<S::Item> {
         self.recording.clone()
+    }
+
+    fn replay_items(
+        &self,
+        items: Vec<RecordedItem<S::Item>>,
+        speed: Option<f64>,
+    ) -> impl Stream<Item = Arc<S::Item>> {
+        let start = tokio::time::Instant::now();
+        let speed = speed.unwrap_or(1.0);
+
+        let mut cumulative = Duration::ZERO;
+        let timed_items: Vec<_> = items
+            .into_iter()
+            .map(|item| {
+                let adjusted_delta = Duration::from_secs_f64(item.delta.as_secs_f64() / speed);
+                cumulative += adjusted_delta;
+                (start + cumulative, item)
+            })
+            .collect();
+
+        futures::stream::iter(timed_items).then(|(target, item)| async move {
+            sleep_until(target).await;
+            Arc::clone(&item.data)
+        })
     }
 
     /// Replays all recorded items with their original timing.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay(&self) -> impl Stream<Item = Arc<S::Item>>
-    where
-        S::Item: Clone,
-    {
+    pub fn replay(&self) -> impl Stream<Item = Arc<S::Item>> {
         let items: Vec<_> = self.recording.items.lock().clone();
 
-        futures::stream::iter(items).then(|item| async move {
-            sleep(item.delta).await;
-            Arc::clone(&item.data)
-        })
+        self.replay_items(items, None)
     }
 
     /// Replays items starting from the specified sequence number.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = Arc<S::Item>>
-    where
-        S::Item: Clone,
-    {
+    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = Arc<S::Item>> {
         let items: Vec<_> = self
             .recording
             .items
@@ -341,19 +356,13 @@ impl<S: Stream> RecordedStream<S> {
             .cloned()
             .collect();
 
-        futures::stream::iter(items).then(|item| async move {
-            sleep(item.delta).await;
-            Arc::clone(&item.data)
-        })
+        self.replay_items(items, None)
     }
 
     /// Replays items recorded since the specified instant.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = Arc<S::Item>>
-    where
-        S::Item: Clone,
-    {
+    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = Arc<S::Item>> {
         let items: Vec<_> = self
             .recording
             .items
@@ -363,19 +372,13 @@ impl<S: Stream> RecordedStream<S> {
             .cloned()
             .collect();
 
-        futures::stream::iter(items).then(|item| async move {
-            sleep(item.delta).await;
-            Arc::clone(&item.data)
-        })
+        self.replay_items(items, None)
     }
 
     /// Replays items within the specified sequence range.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = Arc<S::Item>>
-    where
-        S::Item: Clone,
-    {
+    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = Arc<S::Item>> {
         let items: Vec<_> = self
             .recording
             .items
@@ -385,10 +388,7 @@ impl<S: Stream> RecordedStream<S> {
             .cloned()
             .collect();
 
-        futures::stream::iter(items).then(|item| async move {
-            sleep(item.delta).await;
-            Arc::clone(&item.data)
-        })
+        self.replay_items(items, None)
     }
 
     /// Replays all recorded items with adjusted speed.
@@ -400,21 +400,17 @@ impl<S: Stream> RecordedStream<S> {
     /// Returns [`Error::InvalidSpeed`] if speed is not positive.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_with_speed(&self, speed: f64) -> SturgeonResult<impl Stream<Item = Arc<S::Item>>>
-    where
-        S::Item: Clone,
-    {
+    pub fn replay_with_speed(
+        &self,
+        speed: f64,
+    ) -> SturgeonResult<impl Stream<Item = Arc<S::Item>>> {
         if speed <= 0.0 {
             return Err(Error::InvalidSpeed(speed));
         }
 
         let items: Vec<_> = self.recording.items.lock().clone();
 
-        Ok(futures::stream::iter(items).then(move |item| async move {
-            let adjusted_duration = Duration::from_secs_f64(item.delta.as_secs_f64() / speed);
-            sleep(adjusted_duration).await;
-            Arc::clone(&item.data)
-        }))
+        Ok(self.replay_items(items, Some(speed)))
     }
 }
 
@@ -449,6 +445,7 @@ pub fn record_with_capacity<S: Stream<Item = T>, T: Clone>(
 mod tests {
     use super::*;
     use tokio::time::Instant as TokioInstant;
+    use tokio::time::sleep;
 
     #[tokio::test]
     async fn test_replay_timing_matches_original() {
@@ -466,9 +463,6 @@ mod tests {
         // Record the stream
         while recorded.next().await.is_some() {}
 
-        // Get the recorded events to check deltas
-        let events = recorded.recording().events();
-
         // Replay and verify timing
         let replay_stream = recorded.replay();
         tokio::pin!(replay_stream);
@@ -484,20 +478,10 @@ mod tests {
 
         assert_eq!(count, 3);
 
-        // The first item's delta represents time from recording start
-        // Since we consumed immediately, it should be very small
         assert!(
-            events[0].delta < Duration::from_millis(10),
-            "First item consumed quickly after record start"
+            timings[1] >= Duration::from_millis(40),
+            "Second item should have delay"
         );
-
-        // Subsequent items should have delays as specified
-        if events.len() > 1 && events[1].delta > Duration::ZERO {
-            assert!(
-                timings[1] >= Duration::from_millis(40),
-                "Second item should have delay"
-            );
-        }
     }
 
     #[test]
@@ -750,9 +734,7 @@ mod tests {
         use rand::Rng;
 
         let mut rng = rand::thread_rng();
-        let delays: Vec<u64> = (0..5)
-            .map(|_| rng.gen_range(10..100))
-            .collect();
+        let delays: Vec<u64> = (0..5).map(|_| rng.gen_range(10..100)).collect();
 
         let delays_clone = delays.clone();
         let stream = futures::stream::iter(vec![1, 2, 3, 4, 5])
@@ -773,16 +755,12 @@ mod tests {
         let original_recording = recorded.recording();
         let original_events = original_recording.events();
 
-        let serialized = bincode::serde::encode_to_vec(
-            &original_recording,
-            bincode::config::standard()
-        ).unwrap();
+        let serialized =
+            bincode::serde::encode_to_vec(&original_recording, bincode::config::standard())
+                .unwrap();
 
         let (deserialized_recording, _): (Recording<i32>, _) =
-            bincode::serde::decode_from_slice(
-                &serialized,
-                bincode::config::standard()
-            ).unwrap();
+            bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
 
         let deserialized_events = deserialized_recording.events();
 
@@ -800,8 +778,8 @@ mod tests {
         }
 
         // Now test replay timing after deserialization
-        let replay_stream = futures::stream::iter(deserialized_events.clone())
-            .then(|item| async move {
+        let replay_stream =
+            futures::stream::iter(deserialized_events.clone()).then(|item| async move {
                 sleep(item.delta).await;
                 Arc::clone(&item.data)
             });
@@ -817,7 +795,11 @@ mod tests {
             items.push(*item);
         }
 
-        assert_eq!(items, vec![1, 2, 3, 4, 5], "Replayed items should match original");
+        assert_eq!(
+            items,
+            vec![1, 2, 3, 4, 5],
+            "Replayed items should match original"
+        );
 
         let mut cumulative_delay = Duration::ZERO;
         for (i, timing) in replay_timings.iter().enumerate() {
@@ -830,7 +812,10 @@ mod tests {
             assert!(
                 *timing >= expected_min && *timing <= expected_max,
                 "Replay timing at index {} should be close to expected. Got {:?}, expected between {:?} and {:?}",
-                i, timing, expected_min, expected_max
+                i,
+                timing,
+                expected_min,
+                expected_max
             );
         }
     }
