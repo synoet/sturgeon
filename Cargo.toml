@@ -1,0 +1,10 @@
+[package]
+name = "sturgeon"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+futures = "0.3.31"
+pin-project = "1.1.10"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.47.1", features = ["full"] }
