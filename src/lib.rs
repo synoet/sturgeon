@@ -1,13 +1,103 @@
+//! A library for recording and replaying asynchronous streams with timing information.
+//!
+//! This crate provides utilities to record items from any [`Stream`] along with their
+//! timing information, and replay them later with the same timing characteristics.
+//!
+//! # Examples
+//!
+//! ## Basic Recording and Replay
+//!
+//! ```no_run
+//! use sturgeon::record;
+//! use futures::{stream, StreamExt};
+//!
+//! # async fn example() {
+//! // Create a stream and wrap it with recording
+//! let stream = stream::iter(vec![1, 2, 3]);
+//! let mut recorded = record(stream);
+//!
+//! // Consume the stream (items are recorded as they pass through)
+//! while let Some(item) = recorded.next().await {
+//!     println!("Got: {}", item);
+//! }
+//!
+//! // Replay the recorded items with original timing
+//! let replay = recorded.replay();
+//! tokio::pin!(replay);
+//! while let Some(item) = replay.next().await {
+//!     println!("Replayed: {:?}", item);
+//! }
+//! # }
+//! ```
+//!
+//! ## Bounded Recording
+//!
+//! ```no_run
+//! use sturgeon::record_with_capacity;
+//! use futures::stream;
+//!
+//! # async fn example() {
+//! // Only keep the last 100 items in memory
+//! let stream = stream::iter(vec![1, 2, 3, 4, 5]);
+//! let recorded = record_with_capacity(stream, 100);
+//! # }
+//! ```
+//!
+//! ## Speed-Controlled Replay
+//!
+//! ```no_run
+//! use sturgeon::record;
+//! use futures::{stream, StreamExt};
+//!
+//! # async fn example() {
+//! let stream = stream::iter(vec![1, 2, 3]);
+//! let mut recorded = record(stream);
+//!
+//! // Consume stream...
+//! while let Some(_) = recorded.next().await {}
+//!
+//! // Replay at 2x speed
+//! let fast_replay = recorded.replay_with_speed(2.0).unwrap();
+//!
+//! // Replay at half speed
+//! let slow_replay = recorded.replay_with_speed(0.5).unwrap();
+//! # }
+//! ```
+
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use std::{
+    fmt,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 use tokio::time::sleep;
+
+/// Errors that can occur when working with recorded streams.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Error {
+    /// The recording is empty
+    EmptyRecording,
+    /// Invalid speed parameter (must be positive)
+    InvalidSpeed(f64),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::EmptyRecording => write!(f, "The recording is empty"),
+            Error::InvalidSpeed(speed) => write!(f, "Invalid speed {}: must be positive", speed),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Result type for sturgeon operations.
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// A stream wrapper that records all items passing through it.
 ///
@@ -68,11 +158,14 @@ where
 
         if let Poll::Ready(Some(ref item)) = result {
             let now = Instant::now();
+
+            // Calculate delta: time since last item or since recording started
             let delta = this
                 .last_timestamp
                 .map(|last| now.duration_since(last))
                 .unwrap_or_else(|| now.duration_since(*this.start_timestamp));
 
+            // Record the item with its timing information
             this.recording.push(RecordedItem {
                 seq: *this.seq,
                 timestamp: now,
@@ -80,11 +173,18 @@ where
                 data: Arc::new(item.clone()),
             });
 
+            // Update state for next item
             *this.seq += 1;
             *this.last_timestamp = Some(now);
         }
 
         result
+    }
+}
+
+impl<S> Default for Recording<S> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -108,10 +208,10 @@ impl<S> Recording<S> {
     /// Pushes a new item to the recording, respecting capacity limits.
     fn push(&self, item: RecordedItem<S>) {
         let mut items = self.items.lock();
-        if let Some(cap) = self.capacity {
-            if items.len() >= cap {
-                items.remove(0);
-            }
+        if let Some(cap) = self.capacity
+            && items.len() >= cap
+        {
+            items.remove(0);
         }
         items.push(item);
     }
@@ -296,22 +396,25 @@ impl<S: Stream> RecordedStream<S> {
     /// # Arguments
     /// * `speed` - Playback speed multiplier (e.g., 2.0 for 2x speed, 0.5 for half speed)
     ///
+    /// # Errors
+    /// Returns [`Error::InvalidSpeed`] if speed is not positive.
+    ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_with_speed(&self, speed: f64) -> impl Stream<Item = Arc<S::Item>>
+    pub fn replay_with_speed(&self, speed: f64) -> Result<impl Stream<Item = Arc<S::Item>>>
     where
         S::Item: Clone,
     {
+        if speed <= 0.0 {
+            return Err(Error::InvalidSpeed(speed));
+        }
+
         let items: Vec<_> = self.recording.items.lock().clone();
 
-        futures::stream::iter(items).then(move |item| async move {
-            let adjusted_duration = if speed > 0.0 {
-                Duration::from_secs_f64(item.delta.as_secs_f64() / speed)
-            } else {
-                Duration::ZERO
-            };
+        Ok(futures::stream::iter(items).then(move |item| async move {
+            let adjusted_duration = Duration::from_secs_f64(item.delta.as_secs_f64() / speed);
             sleep(adjusted_duration).await;
             Arc::clone(&item.data)
-        })
+        }))
     }
 }
 
@@ -463,7 +566,7 @@ mod tests {
         tokio::pin!(recorded);
 
         // Consume the stream
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         let events = recorded.recording().events();
         assert_eq!(events.len(), 3, "Should only keep last 3 items");
@@ -486,15 +589,15 @@ mod tests {
         tokio::pin!(recorded);
 
         // Record the stream
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         // Test 2x speed replay
-        let replay_stream = recorded.replay_with_speed(2.0);
+        let replay_stream = recorded.replay_with_speed(2.0).unwrap();
         tokio::pin!(replay_stream);
 
         let start = TokioInstant::now();
         let mut count = 0;
-        while let Some(_) = replay_stream.next().await {
+        while replay_stream.next().await.is_some() {
             count += 1;
         }
         let elapsed = start.elapsed();
@@ -510,7 +613,7 @@ mod tests {
         let recorded = record(stream);
         tokio::pin!(recorded);
 
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         let recording = recorded.recording();
         let range = recording.peek_range(1, 3);
@@ -526,7 +629,7 @@ mod tests {
         let recorded = record(stream);
         tokio::pin!(recorded);
 
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         let recording = recorded.recording();
         let last_3 = recording.peek_last(3);
@@ -542,7 +645,7 @@ mod tests {
         let recorded = record(stream);
         tokio::pin!(recorded);
 
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         let replay_stream = recorded.replay_from(2);
         tokio::pin!(replay_stream);
@@ -561,7 +664,7 @@ mod tests {
         let recorded = record(stream);
         tokio::pin!(recorded);
 
-        while let Some(_) = recorded.next().await {}
+        while recorded.next().await.is_some() {}
 
         let events = recorded.recording().events();
         assert_eq!(events.len(), 3);
@@ -586,7 +689,7 @@ mod tests {
 
         let mut mid_timestamp = None;
         let mut count = 0;
-        while let Some(_) = recorded.next().await {
+        while recorded.next().await.is_some() {
             count += 1;
             if count == 2 {
                 mid_timestamp = Some(Instant::now());
@@ -597,7 +700,7 @@ mod tests {
         let since_mid = recording.peek_since(mid_timestamp.unwrap());
 
         // Should get items 2 and 3 (or just 3, depending on exact timing)
-        assert!(since_mid.len() >= 1 && since_mid.len() <= 2);
+        assert!(!since_mid.is_empty() && since_mid.len() <= 2);
         assert_eq!(**since_mid.last().unwrap(), 3);
     }
 }
