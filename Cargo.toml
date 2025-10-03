@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 futures = "0.3.31"
+parking_lot = "0.12"
 pin-project = "1.1.10"
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.47.1", features = ["full"] }
