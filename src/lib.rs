@@ -12,55 +12,42 @@
 //! use futures::{stream, StreamExt};
 //!
 //! # async fn example() {
-//! // Create a stream and wrap it with recording
 //! let stream = stream::iter(vec![1, 2, 3]);
 //! let mut recorded = record(stream);
 //!
-//! // Consume the stream (items are recorded as they pass through)
 //! while let Some(item) = recorded.next().await {
 //!     println!("Got: {}", item);
 //! }
 //!
-//! // Replay the recorded items with original timing
-//! let replay = recorded.replay();
+//! // Get the recording and replay with original timing
+//! let recording = recorded.recording();
+//! let replay = recording.replay();
 //! tokio::pin!(replay);
 //! while let Some(item) = replay.next().await {
-//!     println!("Replayed: {:?}", item);
+//!     println!("Replayed: {}", item);
 //! }
-//! # }
-//! ```
-//!
-//! ## Bounded Recording
-//!
-//! ```no_run
-//! use sturgeon::record_with_capacity;
-//! use futures::stream;
-//!
-//! # async fn example() {
-//! // Only keep the last 100 items in memory
-//! let stream = stream::iter(vec![1, 2, 3, 4, 5]);
-//! let recorded = record_with_capacity(stream, 100);
 //! # }
 //! ```
 //!
 //! ## Speed-Controlled Replay
 //!
 //! ```no_run
-//! use sturgeon::record;
+//! use sturgeon::{record, Speed};
 //! use futures::{stream, StreamExt};
 //!
 //! # async fn example() {
 //! let stream = stream::iter(vec![1, 2, 3]);
 //! let mut recorded = record(stream);
 //!
-//! // Consume stream...
-//! while let Some(_) = recorded.next().await {}
+//! while recorded.next().await.is_some() {}
+//!
+//! let recording = recorded.recording();
 //!
 //! // Replay at 2x speed
-//! let fast_replay = recorded.replay_with_speed(2.0).unwrap();
+//! let fast = recording.replay_with_speed(Speed::new(2.0).unwrap());
 //!
 //! // Replay at half speed
-//! let slow_replay = recorded.replay_with_speed(0.5).unwrap();
+//! let slow = recording.replay_with_speed(Speed::new(0.5).unwrap());
 //! # }
 //! ```
 use futures::{Stream, StreamExt};
@@ -184,13 +171,13 @@ where
     }
 }
 
-impl<S: Clone> Default for Recording<S> {
+impl<S> Default for Recording<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S: Clone> Recording<S> {
+impl<S> Recording<S> {
     /// Creates a new unbounded recording.
     pub fn new() -> Self {
         Recording {
@@ -199,7 +186,8 @@ impl<S: Clone> Recording<S> {
         }
     }
 
-    /// Creates a new recording with a maximum capacity.
+    /// Creates a recording that keeps only the last `capacity` items.
+    /// Older items are dropped as new ones arrive.
     pub fn with_capacity(capacity: usize) -> Self {
         Recording {
             items: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
@@ -218,93 +206,67 @@ impl<S: Clone> Recording<S> {
         items.push_back(item);
     }
 
-    /// Returns the item at the specified sequence number.
-    pub fn peek_at(&self, seq: u64) -> Option<Arc<S>> {
-        let recording = self.items.lock();
-        recording
-            .iter()
-            .find(|item| item.seq == seq)
-            .map(|item| Arc::clone(&item.data))
+    /// Saves the recording to disk with timing information.
+    pub async fn save(&self, path: impl AsRef<Path>) -> io::Result<()>
+    where
+        S: Serialize,
+    {
+        let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(std::io::Error::other)?;
+        tokio::fs::write(path, bytes).await
     }
 
-    /// Returns items within the specified sequence range.
-    pub fn peek_range(&self, start: u64, end: u64) -> Vec<Arc<S>> {
-        let recording = self.items.lock();
-        recording
-            .iter()
-            .filter(|item| item.seq >= start && item.seq <= end)
-            .map(|item| Arc::clone(&item.data))
-            .collect()
+    /// Loads a recording from disk.
+    pub async fn load(path: impl AsRef<Path>) -> io::Result<Self>
+    where
+        S: for<'de> Deserialize<'de>,
+    {
+        let bytes = tokio::fs::read(path).await?;
+        let (rec, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .map_err(io::Error::other)?;
+        Ok(rec)
     }
+}
+/// A positive playback speed multiplier
+///
+/// Use [`Speed::new`] to validate, and [`Speed::NORMAL`] for 1.0x playback speed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Speed(f64);
 
-    /// Returns the last `n` items from the recording.
-    pub fn peek_last(&self, n: usize) -> Vec<Arc<S>> {
-        let recording = self.items.lock();
-        let len = recording.len();
-        let start = len.saturating_sub(n);
-        recording
-            .iter()
-            .skip(start)
-            .map(|item| Arc::clone(&item.data))
-            .collect()
-    }
-
-    /// Returns items recorded since the specified instant.
-    pub fn peek_since(&self, since: SystemTime) -> Vec<Arc<S>> {
-        let recording = self.items.lock();
-        recording
-            .iter()
-            .filter(|item| item.timestamp >= since)
-            .map(|item| Arc::clone(&item.data))
-            .collect()
-    }
-
-    /// Returns items recorded between the specified instants.
-    pub fn peek_between(&self, start: SystemTime, end: SystemTime) -> Vec<Arc<S>> {
-        let recording = self.items.lock();
-        recording
-            .iter()
-            .filter(|item| item.timestamp >= start && item.timestamp <= end)
-            .map(|item| Arc::clone(&item.data))
-            .collect()
-    }
-
-    /// Returns items from the last specified duration.
-    pub fn peek_last_duration(&self, duration: Duration) -> Vec<Arc<S>> {
-        let recording = self.items.lock();
-        if recording.is_empty() {
-            return Vec::new();
+impl Speed {
+    /// Creates a new playback speed.
+    /// Returns [`Error::InvalidSpeed`] if speed is not positive.
+    pub fn new(value: f64) -> SturgeonResult<Self> {
+        if value <= 0.0 {
+            Err(Error::InvalidSpeed(value))
+        } else {
+            Ok(Speed(value))
         }
-
-        let first_timestamp = recording.front().unwrap().timestamp;
-        let last_timestamp = recording.back().unwrap().timestamp;
-        let cutoff = last_timestamp
-            .checked_sub(duration)
-            .unwrap_or(first_timestamp);
-
-        let mut items: Vec<_> = recording
-            .iter()
-            .rev()
-            .take_while(|item| item.timestamp >= cutoff)
-            .map(|item| Arc::clone(&item.data))
-            .collect();
-        items.reverse();
-        items
     }
 
+    /// Standard playback speed of 1.0x
+    pub const NORMAL: Speed = Speed(1.0);
+
+    pub fn as_f64(&self) -> f64 {
+        self.0
+    }
+}
+
+impl<S: Clone> Recording<S> {
+    #[must_use = "streams do nothing unless polled"]
     fn replay_items(
         &self,
         items: Vec<RecordedItem<S>>,
-        speed: Option<f64>,
+        speed: Speed,
     ) -> impl Stream<Item = Arc<S>> {
         let start = tokio::time::Instant::now();
-        let speed = speed.unwrap_or(1.0);
 
         let mut cumulative = Duration::ZERO;
         let timed_items: Vec<_> = items
             .into_iter()
             .map(|item| {
-                let adjusted_delta = Duration::from_secs_f64(item.delta.as_secs_f64() / speed);
+                let adjusted_delta =
+                    Duration::from_secs_f64(item.delta.as_secs_f64() / speed.as_f64());
                 cumulative += adjusted_delta;
                 (start + cumulative, item)
             })
@@ -316,19 +278,19 @@ impl<S: Clone> Recording<S> {
         })
     }
 
-    /// Replays all recorded items with their original timing.
-    ///
-    /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay(&self) -> impl Stream<Item = Arc<S>> {
+    /// Replays items with original timing delays between them.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay(&self) -> impl Stream<Item = S> {
         let items: Vec<_> = self.items.lock().clone().into_iter().collect();
 
-        self.replay_items(items, None)
+        self.replay_items(items, Speed::NORMAL)
+            .map(|item| (*item).clone())
     }
 
-    /// Replays items starting from the specified sequence number.
-    ///
-    /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = Arc<S>> {
+    /// Replays items starting from sequence number `start_seq`.
+    /// Timing between replayed items is preserved.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = S> {
         let items: Vec<_> = self
             .items
             .lock()
@@ -337,13 +299,14 @@ impl<S: Clone> Recording<S> {
             .cloned()
             .collect();
 
-        self.replay_items(items, None)
+        self.replay_items(items, Speed::NORMAL)
+            .map(|item| (*item).clone())
     }
 
-    /// Replays items recorded since the specified instant.
-    ///
-    /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = Arc<S>> {
+    /// Replays items recorded after `since`.
+    /// Timing between replayed items is preserved.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = S> {
         let items: Vec<_> = self
             .items
             .lock()
@@ -352,13 +315,14 @@ impl<S: Clone> Recording<S> {
             .cloned()
             .collect();
 
-        self.replay_items(items, None)
+        self.replay_items(items, Speed::NORMAL)
+            .map(|item| (*item).clone())
     }
 
-    /// Replays items within the specified sequence range.
-    ///
-    /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = Arc<S>> {
+    /// Replays items within the sequence range `[start, end]` (inclusive).
+    /// Timing between replayed items is preserved.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = S> {
         let items: Vec<_> = self
             .items
             .lock()
@@ -367,52 +331,29 @@ impl<S: Clone> Recording<S> {
             .cloned()
             .collect();
 
-        self.replay_items(items, None)
+        self.replay_items(items, Speed::NORMAL)
+            .map(|item| (*item).clone())
     }
 
-    /// Replays all recorded items with adjusted speed.
-    ///
-    /// # Arguments
-    /// * `speed` - Playback speed multiplier (e.g., 2.0 for 2x speed, 0.5 for half speed)
-    ///
-    /// # Errors
-    /// Returns [`Error::InvalidSpeed`] if speed is not positive.
-    ///
-    /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_with_speed(&self, speed: f64) -> SturgeonResult<impl Stream<Item = Arc<S>>> {
-        if speed <= 0.0 {
-            return Err(Error::InvalidSpeed(speed));
-        }
-
+    /// Replays with adjusted timing. Speed of 2.0 is twice as fast, 0.5 is half the speed.
+    /// Relative timing between replayed items is preserved.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay_with_speed(&self, speed: Speed) -> impl Stream<Item = S> {
         let items: Vec<_> = self.items.lock().iter().cloned().collect();
 
-        Ok(self.replay_items(items, Some(speed)))
+        self.replay_items(items, speed).map(|item| (*item).clone())
     }
 
-    pub fn events(&self) -> Vec<RecordedItem<S>> {
-        self.items.lock().iter().cloned().collect()
-    }
-
-    pub async fn save(&self, path: impl AsRef<Path>) -> io::Result<()>
-    where
-        S: Serialize,
-    {
-        let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        tokio::fs::write(path, bytes).await
-    }
-
-    pub async fn load(path: impl AsRef<Path>) -> io::Result<Self>
-    where
-        S: for<'de> Deserialize<'de>,
-    {
-        let bytes = tokio::fs::read(path).await?;
-        let (rec, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        Ok(rec)
+    /// Replays items immediately without any delays.
+    /// Useful for tests that don't care about timing.
+    #[must_use = "streams do nothing unless polled"]
+    pub fn replay_immediate(&self) -> impl Stream<Item = S> {
+        let items: Vec<_> = self.items.lock().iter().cloned().collect();
+        tokio_stream::iter(items).map(|item| (*item.data).clone())
     }
 }
 
+#[cfg(test)]
 impl<S: PartialEq + std::fmt::Debug> Recording<S> {
     pub fn assert_count(&self, expected: usize) {
         assert_eq!(
@@ -458,15 +399,31 @@ impl<S: Stream> RecordedStream<S>
 where
     S::Item: Clone,
 {
-    /// Returns a clone of the recording.
-    ///
-    /// Requires S::Item: Clone because Recording derives Clone
+    /// Returns the recording captured so far.
+    /// Recording continues as the stream is consumed.
     pub fn recording(&self) -> Recording<S::Item> {
         self.recording.clone()
     }
 }
 
-/// Creates a `RecordedStream` that records all items from the underlying stream.
+/// Wraps a stream to record all items with timing information.
+/// The stream passes through - items are cloned for recording.
+///
+/// # Example
+/// ```
+/// use sturgeon::record;
+/// use futures::{stream, StreamExt};
+/// # async fn example() {
+/// let stream = stream::iter(vec![1, 2, 3]);
+/// let mut recorded = record(stream);
+/// while let Some(item) = recorded.next().await {
+///     // Process items normally
+/// }
+/// // Later: replay with timing preserved
+/// let recording = recorded.recording();
+/// let replay = recording.replay();
+/// # }
+/// ```
 pub fn record<S: Stream<Item = T>, T: Clone>(s: S) -> RecordedStream<S> {
     let now = Instant::now();
     RecordedStream {
@@ -478,7 +435,8 @@ pub fn record<S: Stream<Item = T>, T: Clone>(s: S) -> RecordedStream<S> {
     }
 }
 
-/// Creates a `RecordedStream` with bounded memory that keeps only the last `capacity` items.
+/// Like [`record`] but only keeps the last `capacity` items in memory.
+/// Useful for long-running streams where full history isn't needed.
 pub fn record_with_capacity<S: Stream<Item = T>, T: Clone>(
     s: S,
     capacity: usize,
