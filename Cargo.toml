@@ -9,7 +9,8 @@ futures = "0.3.31"
 parking_lot = { version = "0.12", features = ["serde"] }
 pin-project = "1.1.10"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-tokio = { version = "1.47.1", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full", "test-util"] }
+tokio-stream = "0.1.17"
 
 [dev-dependencies]
 rand = "0.8"

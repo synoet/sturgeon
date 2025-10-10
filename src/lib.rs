@@ -63,18 +63,20 @@
 //! let slow_replay = recorded.replay_with_speed(0.5).unwrap();
 //! # }
 //! ```
-
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     fmt,
+    path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
     time::{Duration, Instant, SystemTime},
 };
+use tokio::io;
 use tokio::time::sleep_until;
 
 /// Errors that can occur when working with recorded streams.
@@ -110,11 +112,11 @@ pub struct RecordedStream<S: Stream> {
     inner: S,
     recording: Recording<S::Item>,
     /// The current sequence number for recorded items
-    pub seq: u64,
+    seq: u64,
     /// The timestamp of the last recorded item
-    pub last_timestamp: Option<Instant>,
+    last_timestamp: Option<Instant>,
     /// The timestamp when recording started
-    pub start_timestamp: Instant,
+    start_timestamp: Instant,
 }
 
 /// A thread-safe recording of stream items with optional capacity limits.
@@ -123,7 +125,7 @@ pub struct RecordedStream<S: Stream> {
 /// It supports bounded or unbounded storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recording<S> {
-    items: Arc<Mutex<Vec<RecordedItem<S>>>>,
+    items: Arc<Mutex<VecDeque<RecordedItem<S>>>>,
     capacity: Option<usize>,
 }
 
@@ -137,13 +139,13 @@ pub struct Recording<S> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedItem<T> {
     /// The sequence number of this item in the recording
-    pub seq: u64,
+    seq: u64,
     /// The instant when this item was recorded
-    pub timestamp: SystemTime,
+    timestamp: SystemTime,
     /// The duration since the previous item
-    pub delta: Duration,
+    delta: Duration,
     /// The actual data item
-    pub data: Arc<T>,
+    data: Arc<T>,
 }
 
 impl<S: Stream> Stream for RecordedStream<S>
@@ -182,17 +184,17 @@ where
     }
 }
 
-impl<S> Default for Recording<S> {
+impl<S: Clone> Default for Recording<S> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<S> Recording<S> {
+impl<S: Clone> Recording<S> {
     /// Creates a new unbounded recording.
     pub fn new() -> Self {
         Recording {
-            items: Arc::new(Mutex::new(Vec::new())),
+            items: Arc::new(Mutex::new(VecDeque::new())),
             capacity: None,
         }
     }
@@ -200,7 +202,7 @@ impl<S> Recording<S> {
     /// Creates a new recording with a maximum capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Recording {
-            items: Arc::new(Mutex::new(Vec::with_capacity(capacity))),
+            items: Arc::new(Mutex::new(VecDeque::with_capacity(capacity))),
             capacity: Some(capacity),
         }
     }
@@ -213,7 +215,7 @@ impl<S> Recording<S> {
         {
             items.remove(0);
         }
-        items.push(item);
+        items.push_back(item);
     }
 
     /// Returns the item at the specified sequence number.
@@ -274,8 +276,8 @@ impl<S> Recording<S> {
             return Vec::new();
         }
 
-        let first_timestamp = recording.first().unwrap().timestamp;
-        let last_timestamp = recording.last().unwrap().timestamp;
+        let first_timestamp = recording.front().unwrap().timestamp;
+        let last_timestamp = recording.back().unwrap().timestamp;
         let cutoff = last_timestamp
             .checked_sub(duration)
             .unwrap_or(first_timestamp);
@@ -290,31 +292,11 @@ impl<S> Recording<S> {
         items
     }
 
-    /// Returns a snapshot of all recorded items.
-    pub fn events(&self) -> Vec<RecordedItem<S>>
-    where
-        S: Clone,
-    {
-        self.items.lock().clone()
-    }
-}
-
-impl<S: Stream> RecordedStream<S>
-where
-    S::Item: Clone,
-{
-    /// Returns a clone of the recording.
-    ///
-    /// Requires S::Item: Clone because Recording derives Clone
-    pub fn recording(&self) -> Recording<S::Item> {
-        self.recording.clone()
-    }
-
     fn replay_items(
         &self,
-        items: Vec<RecordedItem<S::Item>>,
+        items: Vec<RecordedItem<S>>,
         speed: Option<f64>,
-    ) -> impl Stream<Item = Arc<S::Item>> {
+    ) -> impl Stream<Item = Arc<S>> {
         let start = tokio::time::Instant::now();
         let speed = speed.unwrap_or(1.0);
 
@@ -337,8 +319,8 @@ where
     /// Replays all recorded items with their original timing.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay(&self) -> impl Stream<Item = Arc<S::Item>> {
-        let items: Vec<_> = self.recording.items.lock().clone();
+    pub fn replay(&self) -> impl Stream<Item = Arc<S>> {
+        let items: Vec<_> = self.items.lock().clone().into_iter().collect();
 
         self.replay_items(items, None)
     }
@@ -346,9 +328,8 @@ where
     /// Replays items starting from the specified sequence number.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = Arc<S::Item>> {
+    pub fn replay_from(&self, start_seq: u64) -> impl Stream<Item = Arc<S>> {
         let items: Vec<_> = self
-            .recording
             .items
             .lock()
             .iter()
@@ -362,9 +343,8 @@ where
     /// Replays items recorded since the specified instant.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = Arc<S::Item>> {
+    pub fn replay_since(&self, since: SystemTime) -> impl Stream<Item = Arc<S>> {
         let items: Vec<_> = self
-            .recording
             .items
             .lock()
             .iter()
@@ -378,9 +358,8 @@ where
     /// Replays items within the specified sequence range.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = Arc<S::Item>> {
+    pub fn replay_range(&self, start: u64, end: u64) -> impl Stream<Item = Arc<S>> {
         let items: Vec<_> = self
-            .recording
             .items
             .lock()
             .iter()
@@ -400,17 +379,90 @@ where
     /// Returns [`Error::InvalidSpeed`] if speed is not positive.
     ///
     /// Requires S::Item: Clone to clone the recorded items for replay
-    pub fn replay_with_speed(
-        &self,
-        speed: f64,
-    ) -> SturgeonResult<impl Stream<Item = Arc<S::Item>>> {
+    pub fn replay_with_speed(&self, speed: f64) -> SturgeonResult<impl Stream<Item = Arc<S>>> {
         if speed <= 0.0 {
             return Err(Error::InvalidSpeed(speed));
         }
 
-        let items: Vec<_> = self.recording.items.lock().clone();
+        let items: Vec<_> = self.items.lock().iter().cloned().collect();
 
         Ok(self.replay_items(items, Some(speed)))
+    }
+
+    pub fn events(&self) -> Vec<RecordedItem<S>> {
+        self.items.lock().iter().cloned().collect()
+    }
+
+    pub async fn save(&self, path: impl AsRef<Path>) -> io::Result<()>
+    where
+        S: Serialize,
+    {
+        let bytes = bincode::serde::encode_to_vec(self, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        tokio::fs::write(path, bytes).await
+    }
+
+    pub async fn load(path: impl AsRef<Path>) -> io::Result<Self>
+    where
+        S: for<'de> Deserialize<'de>,
+    {
+        let bytes = tokio::fs::read(path).await?;
+        let (rec, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        Ok(rec)
+    }
+}
+
+impl<S: PartialEq + std::fmt::Debug> Recording<S> {
+    pub fn assert_count(&self, expected: usize) {
+        assert_eq!(
+            self.items.lock().len(),
+            expected,
+            "sequence length mismatch"
+        );
+    }
+
+    pub fn assert_sequence(&self, expected: &[S]) {
+        let recording = self.items.lock();
+        let mismatches: Vec<(usize, &S, &S)> = recording
+            .iter()
+            .zip(expected)
+            .enumerate()
+            .filter_map(|(i, (rec, exp))| (*rec.data != *exp).then_some((i, &*(rec.data), exp)))
+            .collect();
+
+        assert!(
+            mismatches.is_empty(),
+            "sequence mismatch at indices {mismatches:?}",
+        )
+    }
+
+    pub fn assert_timing(&self, min: Duration, max: Duration) {
+        let recording = self.items.lock();
+        let violations: Vec<(usize, Duration, Duration)> = recording
+            .iter()
+            .enumerate()
+            .filter_map(|(i, rec)| {
+                (rec.delta < min || rec.delta > max).then_some((i, rec.delta, min))
+            })
+            .collect();
+
+        assert!(
+            violations.is_empty(),
+            "timing violations at indices {violations:?}",
+        )
+    }
+}
+
+impl<S: Stream> RecordedStream<S>
+where
+    S::Item: Clone,
+{
+    /// Returns a clone of the recording.
+    ///
+    /// Requires S::Item: Clone because Recording derives Clone
+    pub fn recording(&self) -> Recording<S::Item> {
+        self.recording.clone()
     }
 }
 
@@ -438,385 +490,5 @@ pub fn record_with_capacity<S: Stream<Item = T>, T: Clone>(
         seq: 0,
         last_timestamp: None,
         start_timestamp: now,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::Instant as TokioInstant;
-    use tokio::time::sleep;
-
-    #[tokio::test]
-    async fn test_replay_timing_matches_original() {
-        // Create a stream with known delays between items
-        let stream = futures::stream::iter(vec![1, 2, 3]).then(|x| async move {
-            if x > 1 {
-                sleep(Duration::from_millis(50)).await;
-            }
-            x
-        });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        // Record the stream
-        while recorded.next().await.is_some() {}
-
-        // Replay and verify timing
-        let replay_stream = recorded.replay();
-        tokio::pin!(replay_stream);
-
-        let start = TokioInstant::now();
-        let mut count = 0;
-        let mut timings = Vec::new();
-
-        while replay_stream.next().await.is_some() {
-            timings.push(start.elapsed());
-            count += 1;
-        }
-
-        assert_eq!(count, 3);
-
-        assert!(
-            timings[1] >= Duration::from_millis(40),
-            "Second item should have delay"
-        );
-    }
-
-    #[test]
-    fn peek_last_duration_returns_chronological_order() {
-        let recording = Recording::new();
-        let base = SystemTime::now();
-
-        {
-            let mut inner = recording.items.lock();
-            inner.push(RecordedItem {
-                seq: 0,
-                timestamp: base,
-                delta: Duration::ZERO,
-                data: Arc::new(1),
-            });
-
-            inner.push(RecordedItem {
-                seq: 1,
-                timestamp: base + Duration::from_secs(1),
-                delta: Duration::from_secs(1),
-                data: Arc::new(2),
-            });
-
-            inner.push(RecordedItem {
-                seq: 2,
-                timestamp: base + Duration::from_secs(3),
-                delta: Duration::from_secs(2),
-                data: Arc::new(3),
-            });
-        }
-
-        let values: Vec<_> = recording
-            .peek_last_duration(Duration::from_secs(2))
-            .into_iter()
-            .map(|item| *item)
-            .collect();
-
-        assert_eq!(values, vec![2, 3]);
-    }
-
-    #[tokio::test]
-    async fn test_first_event_respects_initial_delay() {
-        let stream = futures::stream::iter(vec![1, 2, 3]).then(|x| async move {
-            if x == 1 {
-                // First item has a delay
-                sleep(Duration::from_millis(50)).await;
-            }
-            x
-        });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        // Consume the stream
-        let mut items = Vec::new();
-        while let Some(item) = recorded.next().await {
-            items.push(item);
-        }
-
-        // Check the deltas in the recording
-        let events = recorded.recording().events();
-        // First event's delta should reflect the time from start to first item
-        assert!(
-            events[0].delta >= Duration::from_millis(40),
-            "First event should have initial delay"
-        );
-        // Subsequent events should have small or zero deltas since they come immediately after
-        assert!(
-            events[1].delta < Duration::from_millis(10),
-            "Second event should come quickly"
-        );
-        assert!(
-            events[2].delta < Duration::from_millis(10),
-            "Third event should come quickly"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_bounded_capacity() {
-        let stream = futures::stream::iter(vec![1, 2, 3, 4, 5]);
-        let recorded = record_with_capacity(stream, 3);
-        tokio::pin!(recorded);
-
-        // Consume the stream
-        while recorded.next().await.is_some() {}
-
-        let events = recorded.recording().events();
-        assert_eq!(events.len(), 3, "Should only keep last 3 items");
-        assert_eq!(*events[0].data, 3);
-        assert_eq!(*events[1].data, 4);
-        assert_eq!(*events[2].data, 5);
-    }
-
-    #[tokio::test]
-    async fn test_replay_with_speed() {
-        use tokio::time::Instant as TokioInstant;
-
-        let stream = futures::stream::iter(vec![1, 2, 3]).then(|x| async move {
-            sleep(Duration::from_millis(100)).await;
-            x
-        });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        // Record the stream
-        while recorded.next().await.is_some() {}
-
-        // Test 2x speed replay
-        let replay_stream = recorded.replay_with_speed(2.0).unwrap();
-        tokio::pin!(replay_stream);
-
-        let start = TokioInstant::now();
-        let mut count = 0;
-        while replay_stream.next().await.is_some() {
-            count += 1;
-        }
-        let elapsed = start.elapsed();
-
-        assert_eq!(count, 3);
-        // Should take roughly half the time (with some tolerance)
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "2x speed should be faster"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_peek_range() {
-        let stream = futures::stream::iter(vec![10, 20, 30, 40, 50]);
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let recording = recorded.recording();
-        let range = recording.peek_range(1, 3);
-        assert_eq!(range.len(), 3);
-        assert_eq!(*range[0], 20);
-        assert_eq!(*range[1], 30);
-        assert_eq!(*range[2], 40);
-    }
-
-    #[tokio::test]
-    async fn test_peek_last() {
-        let stream = futures::stream::iter(vec![1, 2, 3, 4, 5]);
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let recording = recorded.recording();
-        let last_3 = recording.peek_last(3);
-        assert_eq!(last_3.len(), 3);
-        assert_eq!(*last_3[0], 3);
-        assert_eq!(*last_3[1], 4);
-        assert_eq!(*last_3[2], 5);
-    }
-
-    #[tokio::test]
-    async fn test_replay_from_seq() {
-        let stream = futures::stream::iter(vec![10, 20, 30, 40]);
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let replay_stream = recorded.replay_from(2);
-        tokio::pin!(replay_stream);
-
-        let mut replayed = Vec::new();
-        while let Some(item) = replay_stream.next().await {
-            replayed.push(*item);
-        }
-
-        assert_eq!(replayed, vec![30, 40]);
-    }
-
-    #[tokio::test]
-    async fn test_events_method() {
-        let stream = futures::stream::iter(vec![100, 200, 300]);
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let events = recorded.recording().events();
-        assert_eq!(events.len(), 3);
-        assert_eq!(*events[0].data, 100);
-        assert_eq!(*events[1].data, 200);
-        assert_eq!(*events[2].data, 300);
-        assert_eq!(events[0].seq, 0);
-        assert_eq!(events[1].seq, 1);
-        assert_eq!(events[2].seq, 2);
-    }
-
-    #[tokio::test]
-    async fn test_peek_since_timestamp() {
-        let stream = futures::stream::iter(vec![1, 2, 3]).then(|x| async move {
-            sleep(Duration::from_millis(50)).await;
-            x
-        });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        let mut mid_timestamp = None;
-        let mut count = 0;
-        while recorded.next().await.is_some() {
-            count += 1;
-            if count == 2 {
-                mid_timestamp = Some(SystemTime::now());
-            }
-        }
-
-        let recording = recorded.recording();
-        let since_mid = recording.peek_since(mid_timestamp.unwrap());
-
-        // Should get items 2 and 3 (or just 3, depending on exact timing)
-        assert!(!since_mid.is_empty() && since_mid.len() <= 2);
-        assert_eq!(**since_mid.last().unwrap(), 3);
-    }
-
-    #[tokio::test]
-    async fn test_serialized_recording() {
-        let stream = futures::stream::iter(vec![1, 2, 3]).then(|x| async move {
-            sleep(Duration::from_millis(50)).await;
-            x
-        });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let recording = recorded.recording();
-        let serialized =
-            bincode::serde::encode_to_vec(&recording, bincode::config::standard()).unwrap();
-        let (deserialized, _): (Recording<i32>, _) =
-            bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
-
-        assert_eq!(
-            recording.items.lock().len(),
-            deserialized.items.lock().len()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_serialized_timing_preserved_with_random_delays() {
-        use rand::Rng;
-
-        let mut rng = rand::thread_rng();
-        let delays: Vec<u64> = (0..5).map(|_| rng.gen_range(10..100)).collect();
-
-        let delays_clone = delays.clone();
-        let stream = futures::stream::iter(vec![1, 2, 3, 4, 5])
-            .enumerate()
-            .then(move |(i, x)| {
-                let delay = delays_clone[i];
-                async move {
-                    sleep(Duration::from_millis(delay)).await;
-                    x
-                }
-            });
-
-        let recorded = record(stream);
-        tokio::pin!(recorded);
-
-        while recorded.next().await.is_some() {}
-
-        let original_recording = recorded.recording();
-        let original_events = original_recording.events();
-
-        let serialized =
-            bincode::serde::encode_to_vec(&original_recording, bincode::config::standard())
-                .unwrap();
-
-        let (deserialized_recording, _): (Recording<i32>, _) =
-            bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
-
-        let deserialized_events = deserialized_recording.events();
-
-        assert_eq!(
-            original_events.len(),
-            deserialized_events.len(),
-            "Should have same number of events"
-        );
-
-        for (orig, deser) in original_events.iter().zip(deserialized_events.iter()) {
-            assert_eq!(orig.seq, deser.seq, "Sequence numbers should match");
-            assert_eq!(orig.timestamp, deser.timestamp, "Timestamps should match");
-            assert_eq!(orig.delta, deser.delta, "Delta durations should match");
-            assert_eq!(*orig.data, *deser.data, "Data should match");
-        }
-
-        // Now test replay timing after deserialization
-        let replay_stream =
-            futures::stream::iter(deserialized_events.clone()).then(|item| async move {
-                sleep(item.delta).await;
-                Arc::clone(&item.data)
-            });
-
-        tokio::pin!(replay_stream);
-
-        let start = TokioInstant::now();
-        let mut replay_timings = Vec::new();
-        let mut items = Vec::new();
-
-        while let Some(item) = replay_stream.next().await {
-            replay_timings.push(start.elapsed());
-            items.push(*item);
-        }
-
-        assert_eq!(
-            items,
-            vec![1, 2, 3, 4, 5],
-            "Replayed items should match original"
-        );
-
-        let mut cumulative_delay = Duration::ZERO;
-        for (i, timing) in replay_timings.iter().enumerate() {
-            cumulative_delay += deserialized_events[i].delta;
-
-            let tolerance = Duration::from_millis(20);
-            let expected_min = cumulative_delay.saturating_sub(tolerance);
-            let expected_max = cumulative_delay + tolerance;
-
-            assert!(
-                *timing >= expected_min && *timing <= expected_max,
-                "Replay timing at index {} should be close to expected. Got {:?}, expected between {:?} and {:?}",
-                i,
-                timing,
-                expected_min,
-                expected_max
-            );
-        }
     }
 }
