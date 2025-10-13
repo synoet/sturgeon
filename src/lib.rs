@@ -450,3 +450,110 @@ pub fn record_with_capacity<S: Stream<Item = T>, T: Clone>(
         start_timestamp: now,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream::{self, StreamExt};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn passthrough_unchanged() {
+        let input = vec![1, 2, 3, 4, 5];
+        let recorded = record(stream::iter(input.clone()));
+        
+        let output: Vec<_> = recorded.collect().await;
+        assert_eq!(output, input);
+    }
+
+    #[tokio::test]
+    async fn replay_order() {
+        for input in [vec![1, 2, 3], vec![5, 4, 3, 2, 1], vec![42], vec![]] {
+            let mut recorded = record(stream::iter(input.clone()));
+            while recorded.next().await.is_some() {}
+            
+            let result: Vec<_> = recorded.recording().replay().collect().await;
+            assert_eq!(result, input);
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_from_seq() {
+        let mut recorded = record(stream::iter(vec![10, 20, 30, 40, 50]));
+        while recorded.next().await.is_some() {}
+        
+        let result: Vec<_> = recorded.recording().replay_from(2).collect().await;
+        assert_eq!(result, vec![30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn replay_range_bounds() {
+        let mut recorded = record(stream::iter(vec![10, 20, 30, 40, 50]));
+        while recorded.next().await.is_some() {}
+        
+        let result: Vec<_> = recorded.recording().replay_range(1, 3).collect().await;
+        assert_eq!(result, vec![20, 30, 40]);
+    }
+
+    #[tokio::test]
+    async fn capacity_bounds_storage() {
+        let mut recorded = record_with_capacity(stream::iter(1..=5), 3);
+        while recorded.next().await.is_some() {}
+        
+        let result: Vec<_> = recorded
+            .recording()
+            .replay_immediate()
+            .collect()
+            .await;
+        
+        assert_eq!(result, vec![3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn immediate_replay_no_delays() {
+        let start = tokio::time::Instant::now();
+        let mut recorded = record(stream::iter(1..=100));
+        while recorded.next().await.is_some() {}
+        
+        let _: Vec<_> = recorded
+            .recording()
+            .replay_immediate()
+            .collect()
+            .await;
+        
+        // Should be instant, not 100x item delays
+        assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn persistence_roundtrip() {
+        let input = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
+        let mut recorded = record(stream::iter(input.clone()));
+        while recorded.next().await.is_some() {}
+        
+        let path = "/tmp/sturgeon_test.bin";
+        recorded.recording().save(path).await.unwrap();
+        
+        let loaded: Recording<String> = Recording::load(path).await.unwrap();
+        let result: Vec<_> = loaded.replay_immediate().collect().await;
+        
+        assert_eq!(result, input);
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[test]
+    fn speed_validates() {
+        assert!(Speed::new(1.0).is_ok());
+        assert!(Speed::new(0.5).is_ok());
+        assert!(Speed::new(2.0).is_ok());
+        
+        assert!(Speed::new(0.0).is_err());
+        assert!(Speed::new(-1.0).is_err());
+        assert!(Speed::new(-0.1).is_err());
+    }
+
+    #[test]
+    fn speed_const_normal() {
+        assert_eq!(Speed::NORMAL.as_f64(), 1.0);
+    }
+}
