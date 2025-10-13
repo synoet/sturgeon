@@ -2,6 +2,13 @@
 name = "sturgeon"
 version = "0.1.0"
 edition = "2024"
+authors = ["synoet"]
+license = "MIT OR Apache-2.0"
+description = "Record async streams with timing, replay deterministically"
+repository = "https://github.com/synoet/sturgeon"
+keywords = ["async", "stream", "testing", "replay", "timing"]
+categories = ["asynchronous", "development-tools::testing"]
+readme = "README.md"
 
 [dependencies]
 bincode = { version = "2.0.1", features = ["serde"] }
