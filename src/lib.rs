@@ -126,11 +126,11 @@ pub struct Recording<S> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecordedItem<T> {
     /// The sequence number of this item in the recording
-    seq: u64,
+    pub seq: u64,
     /// The instant when this item was recorded
-    timestamp: SystemTime,
+    pub timestamp: SystemTime,
     /// The duration since the previous item
-    delta: Duration,
+    pub delta: Duration,
     /// The actual data item
     data: Arc<T>,
 }
@@ -182,6 +182,34 @@ impl<S> Recording<S> {
     pub fn new() -> Self {
         Recording {
             items: Arc::new(Mutex::new(VecDeque::new())),
+            capacity: None,
+        }
+    }
+
+    /// Creates a recording from a sequence of recorded items.
+    pub fn from_items(items: impl IntoIterator<Item = RecordedItem<S>>) -> Self {
+        Recording {
+            items: Arc::new(Mutex::new(VecDeque::from_iter(items))),
+            capacity: None,
+        }
+    }
+
+    /// Creates a recording from a sequence of items.
+    pub fn from_raw_items(items: impl IntoIterator<Item = S>) -> Self {
+        let now = SystemTime::now();
+        let recorded: VecDeque<_> = items
+            .into_iter()
+            .enumerate()
+            .map(|(seq, data)| RecordedItem {
+                seq: seq as u64,
+                timestamp: now,
+                delta: Duration::ZERO,
+                data: Arc::new(data),
+            })
+            .collect();
+
+        Recording {
+            items: Arc::new(Mutex::new(recorded)),
             capacity: None,
         }
     }
@@ -253,6 +281,15 @@ impl Speed {
 }
 
 impl<S: Clone> Recording<S> {
+    /// Returns the items in the recording.
+    pub fn items(&self) -> Vec<S> {
+        self.items
+            .lock()
+            .iter()
+            .map(|i| (*i.data).clone())
+            .collect()
+    }
+
     #[must_use = "streams do nothing unless polled"]
     fn replay_items(
         &self,
@@ -461,7 +498,7 @@ mod tests {
     async fn passthrough_unchanged() {
         let input = vec![1, 2, 3, 4, 5];
         let recorded = record(stream::iter(input.clone()));
-        
+
         let output: Vec<_> = recorded.collect().await;
         assert_eq!(output, input);
     }
@@ -471,7 +508,7 @@ mod tests {
         for input in [vec![1, 2, 3], vec![5, 4, 3, 2, 1], vec![42], vec![]] {
             let mut recorded = record(stream::iter(input.clone()));
             while recorded.next().await.is_some() {}
-            
+
             let result: Vec<_> = recorded.recording().replay().collect().await;
             assert_eq!(result, input);
         }
@@ -481,7 +518,7 @@ mod tests {
     async fn replay_from_seq() {
         let mut recorded = record(stream::iter(vec![10, 20, 30, 40, 50]));
         while recorded.next().await.is_some() {}
-        
+
         let result: Vec<_> = recorded.recording().replay_from(2).collect().await;
         assert_eq!(result, vec![30, 40, 50]);
     }
@@ -490,7 +527,7 @@ mod tests {
     async fn replay_range_bounds() {
         let mut recorded = record(stream::iter(vec![10, 20, 30, 40, 50]));
         while recorded.next().await.is_some() {}
-        
+
         let result: Vec<_> = recorded.recording().replay_range(1, 3).collect().await;
         assert_eq!(result, vec![20, 30, 40]);
     }
@@ -499,13 +536,9 @@ mod tests {
     async fn capacity_bounds_storage() {
         let mut recorded = record_with_capacity(stream::iter(1..=5), 3);
         while recorded.next().await.is_some() {}
-        
-        let result: Vec<_> = recorded
-            .recording()
-            .replay_immediate()
-            .collect()
-            .await;
-        
+
+        let result: Vec<_> = recorded.recording().replay_immediate().collect().await;
+
         assert_eq!(result, vec![3, 4, 5]);
     }
 
@@ -514,13 +547,9 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut recorded = record(stream::iter(1..=100));
         while recorded.next().await.is_some() {}
-        
-        let _: Vec<_> = recorded
-            .recording()
-            .replay_immediate()
-            .collect()
-            .await;
-        
+
+        let _: Vec<_> = recorded.recording().replay_immediate().collect().await;
+
         // Should be instant, not 100x item delays
         assert!(start.elapsed() < Duration::from_millis(100));
     }
@@ -530,13 +559,13 @@ mod tests {
         let input = vec!["foo".to_string(), "bar".to_string(), "baz".to_string()];
         let mut recorded = record(stream::iter(input.clone()));
         while recorded.next().await.is_some() {}
-        
+
         let path = "/tmp/sturgeon_test.bin";
         recorded.recording().save(path).await.unwrap();
-        
+
         let loaded: Recording<String> = Recording::load(path).await.unwrap();
         let result: Vec<_> = loaded.replay_immediate().collect().await;
-        
+
         assert_eq!(result, input);
         let _ = tokio::fs::remove_file(path).await;
     }
@@ -546,7 +575,7 @@ mod tests {
         assert!(Speed::new(1.0).is_ok());
         assert!(Speed::new(0.5).is_ok());
         assert!(Speed::new(2.0).is_ok());
-        
+
         assert!(Speed::new(0.0).is_err());
         assert!(Speed::new(-1.0).is_err());
         assert!(Speed::new(-0.1).is_err());
